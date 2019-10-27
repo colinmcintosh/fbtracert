@@ -112,7 +112,7 @@ func main() {
 	}
 
 	// collect TCP RST's from the target
-	targetAddr, err := resolveName(target, *addrFamily)
+	targetAddr, err := fbtracert.ResolveName(target, *addrFamily)
 	tcpResp, err := fbtracert.TCPReceiver(recvDone, *addrFamily, source, targetAddr.String(), *baseSrcPort, *baseSrcPort+*maxSrcPorts, *targetPort, *maxTTL)
 	if err != nil {
 		return
