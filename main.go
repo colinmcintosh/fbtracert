@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"github.com/facebook/fbtracert/fbtracert"
 	"github.com/golang/glog"
-	"github.com/olekukonko/tablewriter"
+	//"github.com/olekukonko/tablewriter"
 	"net"
-	"os"
+	//"os"
 	"time"
 )
 
@@ -65,7 +65,7 @@ func main() {
 	}
 	target := flag.Arg(0)
 
-	var probes []chan interface{}
+	var probes []chan fbtracert.Probe
 
 	numIters := int(*maxTime * *probeRate / *maxSrcPorts)
 
@@ -108,6 +108,7 @@ func main() {
 	// collect ICMP unreachable messages for our probes
 	icmpResp, err := fbtracert.ICMPReceiver(recvDone, *addrFamily, source)
 	if err != nil {
+        glog.Errorln("Error in setting up ICMP receivers")
 		return
 	}
 
@@ -115,11 +116,12 @@ func main() {
 	targetAddr, err := fbtracert.ResolveName(target, *addrFamily)
 	tcpResp, err := fbtracert.TCPReceiver(recvDone, *addrFamily, source, targetAddr.String(), *baseSrcPort, *baseSrcPort+*maxSrcPorts, *targetPort, *maxTTL)
 	if err != nil {
+        glog.Errorln("Error in setting up TCP receiver")
 		return
 	}
 
 	// add DNS name resolvers to the mix
-	var resolved []chan interface{}
+	var resolved []chan fbtracert.ProbeResponse
 	unresolved := fbtracert.Merge(tcpResp, icmpResp)
 
 	for i := 0; i < *numResolvers; i++ {
@@ -133,27 +135,26 @@ func main() {
 	// maps that store various counters per source port/ttl
 	// e..g sent, for every soruce port, contains vector
 	// of sent packets for each TTL
-	sent := make(map[int] /*src Port */ []int /* pkts sent */)
-	rcvd := make(map[int] /*src Port */ []int /* pkts rcvd */)
-	hops := make(map[int] /*src Port */ []string /* hop name */)
+	//sent := make(map[int] /*src Port */ []int /* pkts sent */)
+	//rcvd := make(map[int] /*src Port */ []int /* pkts rcvd */)
+	hops := make(map[int] /*src Port */ []fbtracert.Hop /* hop name */)
 
 	for srcPort := *baseSrcPort; srcPort < *baseSrcPort+*maxSrcPorts; srcPort++ {
-		sent[srcPort] = make([]int, *maxTTL)
-		rcvd[srcPort] = make([]int, *maxTTL)
-		hops[srcPort] = make([]string, *maxTTL)
+		hops[srcPort] = make([]fbtracert.Hop, *maxTTL)
 		//hops[srcPort][*maxTTL-1] = target
 
 		for i := 0; i < *maxTTL; i++ {
-			hops[srcPort][i] = "?"
+			hops[srcPort][i].SrcAddr = "?"
+			hops[srcPort][i].SrcName = "?"
 		}
 	}
 
 	// collect all probe specs emitted by senders
 	// once all senders terminate, tell receivers to quit too
 	go func() {
-		for val := range fbtracert.Merge(probes...) {
-			probe := val.(fbtracert.Probe)
-			sent[probe.SrcPort][probe.TTL-1]++
+		for probe := range fbtracert.MergeProbes(probes...) {
+			//probe := val.(fbtracert.Probe)
+			hops[probe.SrcPort][probe.TTL-1].Sent++
 		}
 		glog.V(2).Infoln("All senders finished!")
 		// give receivers time to catch up on in-flight data
@@ -169,23 +170,24 @@ func main() {
 	var flappedPorts = make(map[int]bool)
 
 	lastClosed := *maxTTL
-	for val := range fbtracert.Merge(resolved...) {
-		switch val.(type) {
-		case fbtracert.ICMPResponse:
-			resp := val.(fbtracert.ICMPResponse)
-			rcvd[resp.SrcPort][resp.TTL-1]++
-			currName := hops[resp.SrcPort][resp.TTL-1]
-			if currName != "?" && currName != resp.FromName {
-				glog.V(2).Infof("%d: Source port %d flapped at ttl %d from: %s to %s\n", time.Now().UnixNano()/(1000*1000), resp.SrcPort, resp.TTL, currName, resp.FromName)
+	for resp := range fbtracert.Merge(resolved...) {
+		switch resp.Protocol {
+		case "icmp":
+			//resp := val.(fbtracert.ICMPResponse)
+			hops[resp.SrcPort][resp.TTL-1].Received++
+			currName := hops[resp.SrcPort][resp.TTL-1].SrcName
+			if currName != "?" && currName != resp.SrcName {
+				glog.V(2).Infof("%d: Source port %d flapped at ttl %d from: %s to %s\n", time.Now().UnixNano()/(1000*1000), resp.SrcPort, resp.TTL, currName, resp.SrcName)
 				flappedPorts[resp.SrcPort] = true
 			}
-			hops[resp.SrcPort][resp.TTL-1] = resp.FromName
+			hops[resp.SrcPort][resp.TTL-1].SrcName = resp.SrcName
+			hops[resp.SrcPort][resp.TTL-1].SrcAddr = resp.SrcAddr.String()
 			// accumulate all names for processing later
 			// XXX: we may have duplicates, which is OK,
 			// but not very efficient
-			names = append(names, resp.FromName)
-		case fbtracert.TCPResponse:
-			resp := val.(fbtracert.TCPResponse)
+			names = append(names, resp.SrcName)
+		case "tcp":
+			//resp := val.(fbtracert.TCPResponse)
 			// stop all senders sending above this ttl, since they are not needed
 			// XXX: this is not always optimal, i.e. we may receive TCP RST for
 			// a port mapped to a short WAN path, and it would tell us to terminate
@@ -198,17 +200,16 @@ func main() {
 			if resp.TTL < lastClosed {
 				lastClosed = resp.TTL
 			}
-			rcvd[resp.SrcPort][resp.TTL-1]++
-			hops[resp.SrcPort][resp.TTL-1] = target
+			hops[resp.SrcPort][resp.TTL-1].Received++
+			hops[resp.SrcPort][resp.TTL-1].SrcName = resp.SrcName
+			hops[resp.SrcPort][resp.TTL-1].SrcAddr = resp.SrcAddr.String()
 		}
 	}
 
-	for srcPort, hopVector := range hops {
+	for _, hopVector := range hops {
 		for i := range hopVector {
-			// truncate lists once we hit the target name
-			if hopVector[i] == target && i < *maxTTL-1 {
-				sent[srcPort] = sent[srcPort][:i+1]
-				rcvd[srcPort] = rcvd[srcPort][:i+1]
+			// truncate lists once we hit the target address
+			if hopVector[i].SrcAddr == targetAddr.String() && i < *maxTTL-1 {
 				hopVector = hopVector[:i+1]
 				break
 			}
@@ -219,42 +220,36 @@ func main() {
 		glog.Infof("A total of %d ports out of %d changed their paths while tracing\n", len(flappedPorts), *maxSrcPorts)
 	}
 
-	lossyPathSent := make(map[int] /*src port */ []int)
-	lossyPathRcvd := make(map[int] /* src port */ []int)
-	lossyPathHops := make(map[int] /*src port*/ []string)
+	lossyPathHops := make(map[int] /*src port*/ []fbtracert.Hop)
 
 	// process the accumulated data, find and output lossy paths
-	for port, sentVector := range sent {
+	for port, hopVector := range hops {
 		if flappedPorts[port] {
 			continue
 		}
-		if rcvdVector, ok := rcvd[port]; ok {
-			norm, err := fbtracert.NormalizeRcvd(sentVector, rcvdVector)
+        norm, err := fbtracert.NormalizeRcvd(hopVector)
 
-			if err != nil {
-				glog.Errorf("Could not normalize %v / %v", rcvdVector, sentVector)
-				continue
-			}
+        if err != nil {
+            glog.Errorf("Could not normalize %v", hopVector)
+            continue
+        }
 
-			if fbtracert.IsLossy(norm) || *showAll {
-				hosts := make([]string, len(norm))
-				for i := range norm {
-					hosts[i] = hops[port][i]
-				}
-				lossyPathSent[port] = sentVector
-				lossyPathRcvd[port] = rcvdVector
-				lossyPathHops[port] = hosts
-			}
-		} else {
-			glog.Errorf("No responses received for port %d", port)
-		}
+        if fbtracert.IsLossy(norm) || *showAll {
+/*
+            hosts := make([]string, len(norm))
+            for i := range norm {
+                hosts[i] = hops[port][i]
+            }
+*/
+            lossyPathHops[port] = hopVector
+        }
 	}
 
 	if len(lossyPathHops) > 0 {
 		if *jsonOutput {
-			printLossyPathsJSON(lossyPathSent, lossyPathRcvd, lossyPathHops, lastClosed+1)
-		} else {
-			printLossyPaths(lossyPathSent, lossyPathRcvd, lossyPathHops, *maxColumns, lastClosed+1)
+			printLossyPathsJSON(lossyPathHops, lastClosed+1)
+		//} else {
+			//printLossyPaths(lossyPathHops, *maxColumns, lastClosed+1)
 		}
 		return
 	}
@@ -264,7 +259,8 @@ func main() {
 //
 // print the paths reported as having losses
 //
-func printLossyPaths(sent, rcvd map[int] /* src port */ []int, hops map[int] /* src port */ []string, maxColumns, maxTTL int) {
+/*
+func printLossyPaths(hops map[int][]Hop, maxColumns, maxTTL int) {
 	var allPorts []int
 
 	for srcPort := range hops {
@@ -305,11 +301,13 @@ func printLossyPaths(sent, rcvd map[int] /* src port */ []int, hops map[int] /* 
 		fmt.Println("")
 	}
 }
+*/
 
 //
 // Raw Json output for external program to analyze
 //
-func printLossyPathsJSON(sent, rcvd map[int] /* src port */ []int, hops map[int] /* src port */ []string, maxTTL int) {
+func printLossyPathsJSON(hops map[int][]fbtracert.Hop, maxTTL int) {
+/*
 	var report = fbtracert.NewReport()
 
 	for srcPort, path := range hops {
@@ -317,11 +315,12 @@ func printLossyPathsJSON(sent, rcvd map[int] /* src port */ []int, hops map[int]
 		report.Sent[fmt.Sprintf("%d", srcPort)] = sent[srcPort]
 		report.Rcvd[fmt.Sprintf("%d", srcPort)] = rcvd[srcPort]
 	}
+*/
 
-	b, err := json.MarshalIndent(report, "", "\t")
+	b, err := json.MarshalIndent(hops, "", "\t")
 	if err != nil {
 		glog.Errorf("Could not generate JSON %s", err)
 		return
 	}
-	fmt.Println(b)
+	fmt.Println(string(b))
 }

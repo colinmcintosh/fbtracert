@@ -37,23 +37,19 @@ type Probe struct {
 	TTL     int
 }
 
-// ICMPResponse is emitted by ICMPReceiver
-type ICMPResponse struct {
-	Probe
-	FromAddr net.IP
-	FromName string
-	RTT      uint32
-}
-
-// TCPResponse is emitted by TCPReceiver
-type TCPResponse struct {
-	Probe
-	RTT uint32
+type ProbeResponse struct {
+    Probe
+    SrcAddr net.IP
+    SrcName string
+    Protocol string
+    Flags string
+    RecvTTL int
+    RTT uint32
 }
 
 // TCPReceiver Feeds on TCP RST messages we receive from the end host; we use lots of parameters to check if the incoming packet
 // is actually a response to our probe. We create TCPResponse structs and emit them on the output channel
-func TCPReceiver(done <-chan struct{}, af string, srcAddr net.IP, targetAddr string, probePortStart, probePortEnd, targetPort, maxTTL int) (chan interface{}, error) {
+func TCPReceiver(done <-chan struct{}, af string, srcAddr net.IP, targetAddr string, probePortStart, probePortEnd, targetPort, maxTTL int) (chan ProbeResponse, error) {
 	glog.V(2).Infoln("TCPReceiver starting...")
 
 	conn, err := net.ListenPacket(af+":tcp", srcAddr.String())
@@ -62,10 +58,10 @@ func TCPReceiver(done <-chan struct{}, af string, srcAddr net.IP, targetAddr str
 	}
 
 	// we'll be writing the TCPResponse structs to this channel
-	out := make(chan interface{})
+	out := make(chan ProbeResponse)
 
 	// IP + TCP header, this channel is fed from the socket
-	recv := make(chan TCPResponse)
+	recv := make(chan ProbeResponse)
 	go func() {
 		ipHdrSize := 0 // no IPv6 header present on TCP packets received on the raw socket
 		if af == "ip4" {
@@ -121,7 +117,7 @@ func TCPReceiver(done <-chan struct{}, af string, srcAddr net.IP, targetAddr str
 				continue
 			}
 
-			recv <- TCPResponse{Probe: Probe{SrcPort: int(tcpHdr.Destination), TTL: ttl}, RTT: now - ts}
+			recv <- ProbeResponse{Probe: Probe{SrcPort: int(tcpHdr.Destination), TTL: ttl}, Protocol: "tcp", SrcAddr: net.ParseIP(from.String()), RTT: now - ts}
 		}
 	}()
 
@@ -143,7 +139,7 @@ func TCPReceiver(done <-chan struct{}, af string, srcAddr net.IP, targetAddr str
 }
 
 // ICMPReceiver runs on its own collecting ICMP responses until its explicitly told to stop
-func ICMPReceiver(done <-chan struct{}, af string, srcAddr net.IP) (chan interface{}, error) {
+func ICMPReceiver(done <-chan struct{}, af string, srcAddr net.IP) (chan ProbeResponse, error) {
 	var (
 		minInnerIPHdrSize int
 		icmpMsgType       byte
@@ -170,7 +166,7 @@ func ICMPReceiver(done <-chan struct{}, af string, srcAddr net.IP) (chan interfa
 
 	glog.V(2).Infoln("ICMPReceiver is starting...")
 
-	recv := make(chan interface{})
+	recv := make(chan ProbeResponse)
 
 	go func() {
 		// TODO: remove hardcode; 20 bytes for IP header, 8 bytes for ICMP header, 8 bytes for TCP header
@@ -198,11 +194,11 @@ func ICMPReceiver(done <-chan struct{}, af string, srcAddr net.IP) (chan interfa
 			ts := tcpHdr.SeqNum & 0x00ffffff
 			// scale the current time
 			now := uint32(time.Now().UnixNano()/(1000*1000)) & 0x00ffffff
-			recv <- ICMPResponse{Probe: Probe{SrcPort: int(tcpHdr.Source), TTL: ttl}, FromAddr: net.ParseIP(from.String()), RTT: now - ts}
+			recv <- ProbeResponse{Probe: Probe{SrcPort: int(tcpHdr.Source), TTL: ttl}, Protocol: "icmp", SrcAddr: net.ParseIP(from.String()), RTT: now - ts}
 		}
 	}()
 
-	out := make(chan interface{})
+	out := make(chan ProbeResponse)
 	go func() {
 		defer conn.Close()
 		defer close(out)
@@ -221,27 +217,22 @@ func ICMPReceiver(done <-chan struct{}, af string, srcAddr net.IP) (chan interfa
 	return out, nil
 }
 
+// FIXME
 // Resolver resolves names in incoming ICMPResponse messages
 // Everything else is passed through as is
-func Resolver(input chan interface{}) (chan interface{}, error) {
-	out := make(chan interface{})
+func Resolver(input chan ProbeResponse) (chan ProbeResponse, error) {
+	out := make(chan ProbeResponse)
 	go func() {
 		defer close(out)
 
-		for val := range input {
-			switch val.(type) {
-			case ICMPResponse:
-				resp := val.(ICMPResponse)
-				names, err := net.LookupAddr(resp.FromAddr.String())
-				if err != nil {
-					resp.FromName = resp.FromAddr.String()
-				} else {
-					resp.FromName = names[0]
-				}
-				out <- resp
-			default:
-				out <- val
-			}
+		for resp := range input {
+            names, err := net.LookupAddr(resp.SrcAddr.String())
+            if err != nil {
+                resp.SrcName = resp.SrcAddr.String()
+            } else {
+                resp.SrcName = names[0]
+            }
+            out <- resp
 		}
 	}()
 	return out, nil
@@ -250,10 +241,10 @@ func Resolver(input chan interface{}) (chan interface{}, error) {
 // Sender generates TCP SYN packet probes with given TTL at given packet per second rate
 // The packet descriptions are published to the output channel as Probe messages
 // As a side effect, the packets are injected into raw socket
-func Sender(done <-chan struct{}, srcAddr net.IP, af, dest string, dstPort, baseSrcPort, maxSrcPorts, maxIters, ttl, pps, tos int) (chan interface{}, error) {
+func Sender(done <-chan struct{}, srcAddr net.IP, af, dest string, dstPort, baseSrcPort, maxSrcPorts, maxIters, ttl, pps, tos int) (chan Probe, error) {
 	var err error
 
-	out := make(chan interface{})
+	out := make(chan Probe)
 
 	glog.V(2).Infof("Sender for TTL %d starting\n", ttl)
 

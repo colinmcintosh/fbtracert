@@ -9,10 +9,19 @@
 package fbtracert
 
 import (
-	"fmt"
+	//"fmt"
 	"net"
 	"sync"
 )
+
+
+type Hop struct {
+    SrcAddr string
+    SrcName string
+    Sent int
+    Received int
+}
+
 
 //
 // Filter data on input channel
@@ -50,11 +59,38 @@ func Fork(in <-chan interface{}) (out1, out2 chan interface{}) {
 //
 // Merge data from multiple channels into one
 //
-func Merge(cs ...chan interface{}) chan interface{} {
+func Merge(cs ...chan ProbeResponse) chan ProbeResponse {
 	var wg sync.WaitGroup
-	out := make(chan interface{})
+	out := make(chan ProbeResponse)
 
-	output := func(c <-chan interface{}) {
+	output := func(c <-chan ProbeResponse) {
+		defer wg.Done()
+		for val := range c {
+			out <- val
+		}
+	}
+
+	wg.Add(len(cs))
+	for _, ch := range cs {
+		go output(ch)
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
+}
+
+//
+// Merge data from multiple channels into one
+//
+func MergeProbes(cs ...chan Probe) chan Probe {
+	var wg sync.WaitGroup
+	out := make(chan Probe)
+
+	output := func(c <-chan Probe) {
 		defer wg.Done()
 		for val := range c {
 			out <- val
@@ -102,14 +138,14 @@ func IsLossy(hitRates []float64) bool {
 //
 // Normalize rcvd by send count to get the hit rate
 //
-func NormalizeRcvd(sent, rcvd []int) ([]float64, error) {
-	if len(rcvd) != len(sent) {
-		return nil, fmt.Errorf("Length mismatch for sent/rcvd")
-	}
+func NormalizeRcvd(hops []Hop) ([]float64, error) {
+//	if len(rcvd) != len(sent) {
+//		return nil, fmt.Errorf("Length mismatch for sent/rcvd")
+//	}
 
-	result := make([]float64, len(rcvd))
-	for i := range sent {
-		result[i] = float64(rcvd[i]) / float64(sent[i])
+	result := make([]float64, len(hops))
+	for i := range hops {
+		result[i] = float64(hops[i].Received) / float64(hops[i].Sent)
 	}
 
 	return result, nil
